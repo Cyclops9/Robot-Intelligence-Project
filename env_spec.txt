@@ -1,0 +1,21 @@
+TASK: Isaac-Stack-Cube-Franka-v0
+
+--- SCENE ASSETS (Entities you can access) ---
+  - env.scene['robot'] (Articulation) -> The Franka Robot
+  - env.scene['cube'] (RigidObject)   -> The cubes to be stacked
+  - env.scene['ee_frame'] (Frame)     -> End Effector Frame
+
+--- OBSERVATIONS (What the robot sees) ---
+  Group 'policy' (dim: [(8,), (9,), (9,), (39,), (9,), (12,), (3,), (4,), (2,)]):
+    - actions
+    - joint_pos
+    - joint_vel
+    - object
+    - cube_positions
+    - cube_orientations
+    - eef_pos
+    - eef_quat
+    - gripper_pos
+
+--- ACTION SPACE ---
+  Shape: (4096, 8)
