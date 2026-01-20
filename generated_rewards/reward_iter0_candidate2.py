@@ -4,125 +4,109 @@ def compute_reward(env):
     # ----------------------------------------------------------------------
     # 1. Retrieve Data
     # ----------------------------------------------------------------------
-    # TCP Position (Gripper) [Envs, 3]
-    # Using target_pos_w on the ee_frame is the standard way to get TCP pos in Isaac Lab
-    tcp_pos = env.scene["ee_frame"].data.target_pos_w[..., 0, :]
+    # Robot and Object
+    robot = env.scene["robot"]
+    cube = env.scene["object"]
+    ee_frame = env.scene["ee_frame"]
+    
+    # Tensors on device
+    # TCP Position [Envs, 3] and Orientation [Envs, 4] (w, x, y, z)
+    tcp_pos = ee_frame.data.target_pos_w[..., 0, :]
+    tcp_quat = ee_frame.data.target_quat_w[..., 0, :]
     
     # Cube Position [Envs, 3]
-    cube_pos = env.scene["object"].data.root_pos_w[..., 0:3]
+    cube_pos = cube.data.root_pos_w[..., 0:3]
     cube_height = cube_pos[..., 2]
     
-    # Joint Velocities [Envs, 7] for smoothness penalty
-    joint_vel = env.scene['robot'].data.joint_vel
+    # Robot Joint Data for penalties
+    joint_vel = robot.data.joint_vel
     
-    # Get current actions [Envs, 8]. Last dim [7] is gripper position command.
-    actions = env.action_manager.action
-    gripper_action = actions[..., 7]
-
-    # Task Parameters
+    # ----------------------------------------------------------------------
+    # 2. Definitions & Constants
+    # ----------------------------------------------------------------------
     target_height = 0.5
-    table_height = 0.02  # Approximate table height
+    table_height = 0.02
+    dist_scale = 10.0  # Controls the sharpness of the reach reward
     
-    # Thresholds for defining states
-    grasp_dist_threshold = 0.04
-    # Gripper action is usually [-1, 1]. Negative is closing.
-    gripper_close_action_threshold = -0.3 
-    # Height at which we consider the lift stage to have started
-    lift_start_height = table_height + 0.02
-
+    # Distance from TCP to Cube
+    dist = torch.norm(tcp_pos - cube_pos, dim=-1)
+    
     # ----------------------------------------------------------------------
-    # 2. Calculate Reward Components
+    # 3. Reward Components
     # ----------------------------------------------------------------------
     
-    # --- Distance ---
-    dist_tcp_cube = torch.norm(tcp_pos - cube_pos, dim=-1)
-
-    # --- A. Reaching Reward ---
-    # Standard shaped reward to bring TCP to the cube center.
-    # Using tanh(5.0 * dist) provides a good gradient over roughly 40cm.
-    reward_reach = 1.0 - torch.tanh(5.0 * dist_tcp_cube)
-
-    # --- B. Grasping Reward (Continuous) ---
-    # Encourage closing the gripper, but ONLY when very close to the cube.
-    # This prevents the robot from just closing the gripper far away.
+    # --- A. Approach/Reach Reward ---
+    # We use a Tanh kernel which is bounded [0, 1] and provides good gradients near 0.
+    # At dist=0.1 (10cm), tanh(1.0) ~0.76 -> reward ~0.24
+    # At dist=0.02 (2cm), tanh(0.2) ~0.20 -> reward ~0.80
+    reward_reach = 1.0 - torch.tanh(dist_scale * dist)
     
-    # 1. Define a very sharp continuous "closeness" factor [0, 1].
-    # High only when dist < ~5cm.
-    is_very_close = 1.0 - torch.tanh(20.0 * dist_tcp_cube)
+    # --- B. Orientation Reward (Top-Down Prior) ---
+    # To successfully grasp a cube on a table, a top-down approach is most stable.
+    # We encourage the TCP Z-axis to align with the World Down vector (0, 0, -1).
+    # Rotation Matrix Z-axis from Quat (w, x, y, z):
+    # z_z = 1 - 2(x^2 + y^2)
+    x = tcp_quat[..., 1]
+    y = tcp_quat[..., 2]
+    tcp_z_z = 1.0 - 2.0 * (x**2 + y**2)
     
-    # 2. Define a "closing intention" factor based on action.
-    # Assuming action range [-1, 1], where -1 is closed.
-    # This factor becomes positive as action becomes negative (closing).
-    closing_intention = torch.clamp(-gripper_action, min=0.0)
+    # We want tcp_z_z to be -1 (pointing down).
+    # We define alignment as -tcp_z_z (range -1 to 1).
+    # We clamp to 0 to treat all upward/sideways orientations as 0.
+    reward_orient = torch.clamp(-tcp_z_z, min=0.0)
     
-    # Combine: Reward = Being Close * Trying to Close
-    reward_grasp = is_very_close * closing_intention
-
-    # --- C. Lifting Reward (Staged) ---
-    # We want to reward lifting towards the target height, but we must ensure
-    # it's due to a grasp, not just pushing the cube up.
+    # --- C. Lift Reward ---
+    # This is the primary driver once the object is grasped.
+    # We calculate progress from table to target height.
+    lift_height = cube_height - table_height
+    lift_progress = torch.clamp(lift_height / (target_height - table_height), min=0.0, max=1.0)
     
-    # Define a rigorous proxy condition for a successful grasp:
-    # 1. TCP is geometrically close to the cube.
-    # 2. Gripper is actively being commanded to close.
-    # 3. The cube has actually moved up off the table surface.
-    has_grasp_proxy = (dist_tcp_cube < grasp_dist_threshold) & \
-                      (gripper_action < gripper_close_action_threshold) & \
-                      (cube_height > lift_start_height)
+    # We scale this reward so that a full lift is significantly valuable.
+    # Weighting rationale: If lift is achieved, this should dominate the reach reward
+    # to prevent the robot from diving back down to minimize 'dist' if the cube shifts in hand.
+    reward_lift = lift_progress * 3.0
     
-    # Shaping towards target height.
-    dist_to_target = torch.abs(target_height - cube_height)
-    lift_shaping = 1.0 - torch.tanh(3.0 * dist_to_target)
-    
-    # Apply lifting reward only when the rigorous grasp proxy is met.
-    # This gate prevents "batting" rewards.
-    reward_lift = has_grasp_proxy.float() * lift_shaping
-
-    # --- D. Success Bonus (Sparse) ---
-    # High reward for reaching the final target height.
+    # --- D. Success Bonus ---
+    # A large sparse reward for achieving the target height.
     is_success = (cube_height > (target_height - 0.05)).float()
-    reward_success = is_success * 25.0
-
+    reward_success = is_success * 5.0
+    
     # --- E. Penalties ---
-    # Penalize high joint velocities for smooth motion.
-    # Small penalty on action magnitude to encourage efficient control.
-    reward_joint_vel = -0.002 * torch.sum(torch.square(joint_vel), dim=-1)
-    reward_action_mag = -0.005 * torch.sum(torch.square(actions), dim=-1)
+    # 1. Smoothness: Penalize joint velocities to prevent shaking.
+    #    Reduced weight to -0.001 to allow fast movements required for lifting.
+    reward_penalty_smoothness = -0.001 * torch.sum(torch.square(joint_vel), dim=-1)
+    
+    # 2. Linear Distance Penalty:
+    #    Ensures a gradient exists even when far from the object (where tanh is saturated).
+    reward_penalty_dist = -0.2 * dist
 
     # ----------------------------------------------------------------------
-    # 3. Compute Total Reward
+    # 4. Total Reward Calculation
     # ----------------------------------------------------------------------
-    # Compose the total reward with carefully chosen weights to guide the stages.
-    # Reach -> Grasp -> Lift -> Success.
+    # Total Reward Construction
+    # Reach (1.0) + Orient (0.5) guides the approach.
+    # Lift (3.0) takes over as the object rises.
+    # Success (5.0) provides the final satisfaction.
     total_reward = (
-        2.0 * reward_reach      # Stage 1: Get to object
-        + 5.0 * reward_grasp    # Stage 2: Initiate grasp when close
-        + 15.0 * reward_lift    # Stage 3: Lift while holding (primary driver)
-        + reward_success        # Stage 4: Final goal achievement
-        + reward_joint_vel      # Regularization
-        + reward_action_mag     # Regularization
+        reward_reach + 
+        0.5 * reward_orient + 
+        reward_lift + 
+        reward_success + 
+        reward_penalty_smoothness + 
+        reward_penalty_dist
     )
 
     # ----------------------------------------------------------------------
-    # 4. Ground Truth & Logging
+    # 5. Logging
     # ----------------------------------------------------------------------
-    try:
-        # Log individual reward components for debugging purposes
-        env.extras["episode"]["GPT/reward_reach"] = reward_reach.mean().item()
-        env.extras["episode"]["GPT/reward_grasp"] = reward_grasp.mean().item()
-        env.extras["episode"]["GPT/reward_lift"] = reward_lift.mean().item()
-        env.extras["episode"]["GPT/reward_success"] = reward_success.mean().item()
-        
-        # Log key physical metrics to track progress independent of rewards
-        env.extras["episode"]["GPT/dist_tcp_cube"] = dist_tcp_cube.mean().item()
-        env.extras["episode"]["GPT/cube_height"] = cube_height.mean().item()
-        env.extras["episode"]["GPT/gt_success"] = is_success.mean().item()
+    env.extras["GPT/reward_reach"] = reward_reach.mean()
+    env.extras["GPT/reward_orient"] = reward_orient.mean()
+    env.extras["GPT/reward_lift"] = reward_lift.mean()
+    env.extras["GPT/reward_success"] = reward_success.mean()
+    env.extras["GPT/dist_tcp_cube"] = dist.mean()
+    env.extras["GPT/cube_height"] = cube_height.mean()
+    
+    # REQUIRED: Success Rate Log
+    env.extras["GPT/success"] = is_success.mean()
 
-    except Exception:
-        # Ensure training doesn't crash if logging fails
-        pass
-
-    # ----------------------------------------------------------------------
-    # 5. Return Final Tensor
-    # ----------------------------------------------------------------------
     return total_reward

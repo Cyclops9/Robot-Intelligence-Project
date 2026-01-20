@@ -1,0 +1,78 @@
+import torch
+
+def compute_reward(env):
+    # ----------------------------------------------------------------------
+    # 1. Retrieve Data (Correct Isaac Lab API)
+    # ----------------------------------------------------------------------
+    # TCP Position (Gripper) [Envs, 3]
+    tcp_pos = env.scene["ee_frame"].data.target_pos_w[..., 0, :]
+    
+    # Cube Position [Envs, 3]
+    cube_pos = env.scene["object"].data.root_pos_w[..., 0:3]
+    
+    # Goal/Target Height
+    target_height = 0.5
+
+    # ----------------------------------------------------------------------
+    # 2. Calculate Components
+    # ----------------------------------------------------------------------
+    # Component A: Reaching Reward (Get gripper close to cube)
+    dist_tcp_cube = torch.norm(tcp_pos - cube_pos, dim=-1)
+    # Transform distance to [0, 1] score using tanh
+    reward_reach = 1.0 - torch.tanh(5.0 * dist_tcp_cube)
+
+    # Component B: Lifting Reward (Raise cube Z position)
+    cube_height = cube_pos[..., 2]
+    # Only reward lifting if gripper is close (prevents waving in air)
+    is_close = (dist_tcp_cube < 0.05).float()
+    reward_lift = is_close * cube_height 
+
+    # Component C: Penalty for moving too fast (Regularization)
+    reward_penalty = -0.01 * dist_tcp_cube  # Small penalty for being far away
+
+    # ----------------------------------------------------------------------
+    # 3. Compute Total
+    # ----------------------------------------------------------------------
+    total_reward = reward_reach + (2.0 * reward_lift) + reward_penalty
+
+    # ----------------------------------------------------------------------
+    # 6. GROUND TRUTH CALCULATION (The "Lie Detector")
+    # ----------------------------------------------------------------------
+    # A. Calculate Timeout Manually
+    # env.episode_length_buf holds the current step count for each env
+    # env.max_episode_length is the limit (e.g., 500)
+    current_step = env.episode_length_buf
+    max_steps = env.max_episode_length
+    # 1.0 if we hit the limit, 0.0 otherwise
+    manual_timeout = (current_step >= max_steps).float()
+
+    # B. Calculate Success Manually (Task Specific)
+    # For Lift: Success = Cube is lifted above target height (minus tolerance)
+    is_success = (cube_pos[..., 2] > (target_height - 0.05)).float()
+
+    # ----------------------------------------------------------------------
+    # 4. CRITICAL: Log Components for Eureka Feedback
+    # ----------------------------------------------------------------------
+    try:
+        # RSL-RL expects custom metrics to be inside an 'episode' dictionary.
+        # We must check if it exists, create it if not, and write there.
+        if "episode" not in env.extras:
+            env.extras["episode"] = {}
+
+        # Write Reward Components
+        env.extras["episode"]["GPT/reward_reach"] = reward_reach.mean().item()
+        env.extras["episode"]["GPT/reward_lift"] = reward_lift.mean().item()
+        env.extras["episode"]["GPT/reward_penalty"] = reward_penalty.mean().item()
+        env.extras["episode"]["GPT/dist_tcp_cube"] = dist_tcp_cube.mean().item()
+        
+        # Write Ground Truth (So the LLM knows if it actually worked)
+        env.extras["episode"]["GPT/gt_timeout"] = manual_timeout.mean().item()
+        env.extras["episode"]["GPT/gt_success"] = is_success.mean().item()
+
+    except Exception as e:
+        print(f"[REWARD ERROR] Logging failed: {e}")
+
+    # ----------------------------------------------------------------------
+    # 5. Return ONLY the Total Tensor
+    # ----------------------------------------------------------------------
+    return total_reward

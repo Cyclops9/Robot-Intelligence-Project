@@ -1,0 +1,141 @@
+
+You are an expert RL Reward Designer.
+Your goal is to IMPROVE the reward function for: Isaac-Lift-Cube-Franka-v0.
+
+--- ENVIRONMENT CONTEXT ---
+
+TASK: Isaac-Lift-Cube-Franka-v0
+
+--- SCENE ASSETS (Correct Names) ---
+  - env.scene['robot'] (Articulation)   -> The Franka Robot
+  - env.scene['object'] (RigidObject)   -> The Cube (Target to lift)
+  - env.scene['ee_frame'] (Frame)       -> End Effector Frame (The Gripper)
+  - env.scene['table'] (RigidObject)    -> Table Surface
+
+--- ACTION SPACE ---
+  - Size: 8 Dimensions
+  - [0-6]: Arm Joint Positions (7 DOF)
+  - [7]:   Gripper Position (1 DOF)
+
+
+--- CRITICAL RULES ---
+1. You MUST return a single tensor 'total_reward'.
+2. You MUST log components to env.extras['GPT/name'] = value.mean().
+3. Use torch operations. Tensors must be on env.device.
+4. The system deletes old rewards. You MUST re-implement 'action_rate' or 'smoothness' penalties to prevent shaking.
+5. You MUST log the success rate to env.extras['GPT/success'] = is_success.mean().
+6. DO NOT use 'success' as a key, use 'GPT/success'.
+
+--- COMMON PITFALLS ---
+1. DO NOT access 'env.actions'. The 'env' object is a ManagerBasedRLEnv.
+2. To access the robot's current joint positions, use: 
+   env.scene['robot'].data.joint_pos
+3. To access the last applied action, use:
+   env.action_manager.action
+
+
+--- PREVIOUS CODE ---
+```python
+import torch
+
+def compute_reward(env):
+    # ----------------------------------------------------------------------
+    # 1. Retrieve Data
+    # ----------------------------------------------------------------------
+    # TCP (Gripper) Position [Envs, 3]
+    # We take the 0-th index of the frame target pos if it has multiple points, usually it is [..., 3]
+    tcp_pos = env.scene["ee_frame"].data.target_pos_w[..., 0, :]
+    
+    # Cube Position [Envs, 3]
+    cube_pos = env.scene["object"].data.root_pos_w[..., 0:3]
+    
+    # Joint Velocities [Envs, Num_Joints]
+    # Used for smoothness penalty (replaces action_rate if history not available)
+    joint_vel = env.scene["robot"].data.joint_vel
+
+    # Constants
+    target_height = 0.5
+    
+    # ----------------------------------------------------------------------
+    # 2. Calculate Components
+    # ----------------------------------------------------------------------
+    
+    # --- Component A: Reaching (Approach the object) ---
+    dist_tcp_cube = torch.norm(tcp_pos - cube_pos, dim=-1)
+    # Use a sharper tanh curve (scale=10.0) to encourage very precise positioning
+    # Previous code used 5.0, which might be too loose for grasping.
+    reward_reach = 1.0 - torch.tanh(10.0 * dist_tcp_cube)
+    
+    # --- Component B: Lifting (Raise the object) ---
+    # We use the raw Z height of the cube.
+    # Since the cube is a rigid body, the robot can only increase this value by physically lifting it.
+    # This provides a dense gradient once grasped.
+    cube_height = cube_pos[..., 2]
+    # We assume table is at ~0.02m. Target is 0.5m.
+    # Weight this heavily to prioritize lifting over just hovering.
+    reward_lift = cube_height
+    
+    # --- Component C: Penalties (Regularization) ---
+    # 1. Action Smoothness (Joint Velocity Penalty)
+    # Penalize high velocities to prevent jitter/shaking which breaks grasps.
+    reward_penalty_smoothness = -0.001 * torch.sum(torch.square(joint_vel), dim=-1)
+    
+    # 2. Linear Distance Penalty
+    # Tanh becomes flat near 0. Adding a small linear penalty keeps the gradient 
+    # active at very close ranges (0.01m vs 0.001m).
+    reward_penalty_dist = -0.5 * dist_tcp_cube
+
+    # --- Component D: Success Bonus ---
+    # Threshold slightly below target to ensure robust detection (0.5 - 0.05 = 0.45)
+    is_success = (cube_height > (target_height - 0.05)).float()
+    reward_success = is_success * 2.0
+
+    # ----------------------------------------------------------------------
+    # 3. Compute Total
+    # ----------------------------------------------------------------------
+    # Weights Rationale:
+    # - Reach (2.0): Enough to get there.
+    # - Lift (5.0): Strong incentive. If cube_height goes from 0.02 to 0.5, reward adds ~2.5.
+    # - Success (2.0): Big sparse bonus for completing task.
+    total_reward = (2.0 * reward_reach) + (5.0 * reward_lift) + reward_success + reward_penalty_smoothness + reward_penalty_dist
+
+    # ----------------------------------------------------------------------
+    # 4. Log for Feedback
+    # ----------------------------------------------------------------------
+    # Check if 'episode' dict exists (RSL-RL standard)
+    if "episode" not in env.extras:
+        env.extras["episode"] = {}
+
+    # Log components
+    env.extras["episode"]["GPT/reward_reach"] = reward_reach.mean().item()
+    env.extras["episode"]["GPT/reward_lift"] = reward_lift.mean().item()
+    env.extras["episode"]["GPT/reward_success"] = reward_success.mean().item()
+    env.extras["episode"]["GPT/cube_height"] = cube_height.mean().item()
+    env.extras["episode"]["GPT/dist_tcp_cube"] = dist_tcp_cube.mean().item()
+    
+    # REQUIRED: Success Rate Log (outside episode dict for direct tracking if needed, or consistent with prompt)
+    env.extras["GPT/success"] = is_success.mean()
+
+    return total_reward
+--- FEEDBACK (Performance of Previous Code) --- Feedback for Candidate 0:
+--- GROUND TRUTH ---
+Success Rate: 0.00 (1.0 = 100% success)
+Timeout Rate: 0.00 (High timeout = robot is stuck)
+Total Reward: 0.00
+--- REWARD COMPONENTS ---
+  - reward_reach: Mean=0.63, Max=0.77, Trend_End=0.77
+  - reward_lift: Mean=0.02, Max=0.02, Trend_End=0.02
+  - reward_success: Mean=0.00, Max=0.00, Trend_End=0.00
+  - cube_height: Mean=0.02, Max=0.02, Trend_End=0.02
+  - dist_tcp_cube: Mean=0.06, Max=0.33, Trend_End=0.03
+
+
+--- INSTRUCTIONS ---
+
+Analyze the feedback. Identify which components are zero (not working) or negative (penalties too high).
+
+Generate ONE improved reward function.
+
+CRITICAL: Return ONLY the Python code block. Do not add conversational text like "Here is the code".
+
+The function signature must be def compute_reward(env):. 

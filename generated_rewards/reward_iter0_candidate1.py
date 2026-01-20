@@ -4,118 +4,96 @@ def compute_reward(env):
     # ----------------------------------------------------------------------
     # 1. Retrieve Data
     # ----------------------------------------------------------------------
-    # TCP Position (Gripper Center) [Envs, 3]
+    # TCP (Gripper) Position [Envs, 3]
+    # Accessing the first body in the end-effector frame
     tcp_pos = env.scene["ee_frame"].data.target_pos_w[..., 0, :]
     
     # Cube Position [Envs, 3]
     cube_pos = env.scene["object"].data.root_pos_w[..., 0:3]
+    
+    # Cube Height (Z)
     cube_height = cube_pos[..., 2]
     
-    # Joint States
-    # The Franka robot typically has 9 joints in its state vector (7 arm + 2 gripper fingers).
-    joint_pos = env.scene['robot'].data.joint_pos
-    joint_vel = env.scene['robot'].data.joint_vel
+    # Joint Velocities [Envs, Num_Joints]
+    joint_vel = env.scene["robot"].data.joint_vel
     
-    # Extract gripper finger positions (last 2 joints, indices 7 and 8)
-    # Typical range for Franka fingers: ~0.04m (fully open) to ~0.0m (fully closed) per finger.
-    finger_pos = joint_pos[..., 7:9]
-    mean_finger_pos = torch.mean(finger_pos, dim=-1)
-
-    # Get current actions [Envs, 8] for penalty calculation.
+    # Current Actions [Envs, Action_Dim]
     actions = env.action_manager.action
 
-    # Goal/Target Parameters
+    # ----------------------------------------------------------------------
+    # 2. Definitions & Constants
+    # ----------------------------------------------------------------------
     target_height = 0.5
-    table_height = 0.02
+    # Threshold to determine if object is on the table or lifted
+    # We assume table/ground is near Z=0, with a small buffer.
+    table_height_threshold = 0.04  
+    
+    # Euclidean distance from TCP to Cube
+    dist = torch.norm(tcp_pos - cube_pos, dim=-1)
     
     # ----------------------------------------------------------------------
-    # 2. Define Helper Signals (Continuous 0 to 1)
-    # ----------------------------------------------------------------------
-    # Distance from TCP to Cube
-    dist_tcp_cube = torch.norm(tcp_pos - cube_pos, dim=-1)
-    
-    # Signal for being close to the cube. 1 when close, 0 when far.
-    # Using a sharp tanh kernel.
-    is_close = 1.0 - torch.tanh(15.0 * dist_tcp_cube)
-    
-    # Signal for gripper being closed based on physical state. 1 when closed, 0 when open.
-    # Map mean finger pos from [0, 0.04] to roughly [1, 0].
-    # 0.04 * 60 = 2.4 -> tanh(2.4) ~= 0.98. 1 - 0.98 = 0.02 (Open)
-    # 0.00 * 60 = 0.0 -> tanh(0.0) = 0.00. 1 - 0.00 = 1.00 (Closed)
-    is_gripper_closed = 1.0 - torch.tanh(mean_finger_pos * 60.0)
-    
-    # Combined "soft grasp" signal: close to cube AND gripper physically closed.
-    # This is crucial for gating the lifting reward.
-    soft_grasp = is_close * is_gripper_closed
-
-    # ----------------------------------------------------------------------
-    # 3. Calculate Reward Components
+    # 3. Reward Components
     # ----------------------------------------------------------------------
     
-    # --- A. Reaching Reward ---
-    # Encourage TCP to get close to the cube. This is the first stage.
-    reward_reach = is_close
-
-    # --- B. Grasping Reward ---
-    # Encourage having the gripper closed, but ONLY when near the cube.
-    # This guides the agent to connect the act of closing with proximity to the target.
-    reward_grasp = soft_grasp
-
-    # --- C. Lifting Reward ---
-    # Encourage raising the cube. This reward is heavily gated by the `soft_grasp`
-    # signal to prevent rewarding "batting" or knocking the cube up without control.
+    # --- A. Approach Reward ---
+    # We use a Tanh kernel: 1 - tanh(scale * dist).
+    # This is bounded [0, 1] and provides smooth gradients both near and far.
+    # Scale 5.0 implies:
+    #   at dist=0.2m (20cm), reward ~ 0.24
+    #   at dist=0.05m (5cm), reward ~ 0.75
+    #   at dist=0.01m (1cm), reward ~ 0.95
+    reward_approach = 1.0 - torch.tanh(5.0 * dist)
     
-    # Reward for absolute height above table.
-    height_above_table = torch.clamp(cube_height - table_height, min=0.0)
+    # --- B. Lift Reward ---
+    # We reward height above the table threshold.
+    # We scale this by 4.0 so that lifting becomes the dominant strategy over just hovering.
+    # e.g., lifting to 0.25m gives ~0.84 reward, comparable to the max approach reward.
+    # lifting to target 0.5m gives ~1.84 reward.
+    reward_lift = torch.clamp(cube_height - table_height_threshold, min=0.0) * 4.0
     
-    # Reward for getting closer to the specific target height.
-    dist_to_target = torch.abs(target_height - cube_height)
-    close_to_target_height = 1.0 - torch.tanh(5.0 * dist_to_target)
-
-    # Composite lifting reward, scaled up as it's the main task.
-    # We reward both absolute height and proximity to target height, gated by grasp.
-    reward_lift = soft_grasp * (10.0 * height_above_table + 5.0 * close_to_target_height)
+    # --- C. Grasp/Holding Bonus ---
+    # If the robot is close to the object AND the object is slightly lifted off the table,
+    # we provide a constant bonus. This helps bridge the transition from "touching" to "lifting".
+    # It tells the agent: "You have it, don't let go."
+    is_lifted_slightly = (cube_height > (table_height_threshold + 0.01)).float()
+    is_close = (dist < 0.04).float()
+    reward_grasp = is_lifted_slightly * is_close * 1.0
 
     # --- D. Success Bonus ---
-    # A large sparse bonus for achieving the target height within a tolerance.
+    # A large sparse reward for reaching the target height.
     is_success = (cube_height > (target_height - 0.05)).float()
-    reward_success = is_success * 50.0
-
+    reward_success = is_success * 5.0
+    
     # --- E. Penalties ---
-    # Penalize high joint velocities and action magnitudes to encourage smooth, efficient motion.
-    # Weights are kept low to not discourage exploration.
-    reward_joint_vel = -0.001 * torch.sum(torch.square(joint_vel), dim=-1)
-    reward_action_mag = -0.001 * torch.sum(torch.square(actions), dim=-1)
+    # 1. Action Regularization: Penalize large action commands to prevent "banging" against limits.
+    reward_penalty_action = -0.01 * torch.sum(torch.square(actions), dim=-1)
+    
+    # 2. Smoothness: Penalize high joint velocities to reduce jitter.
+    reward_penalty_smoothness = -0.001 * torch.sum(torch.square(joint_vel), dim=-1)
 
     # ----------------------------------------------------------------------
-    # 4. Compute Total Reward
+    # 4. Total Reward Calculation
     # ----------------------------------------------------------------------
-    # Combine components with weights adjusted to prioritize the staged learning.
     total_reward = (
-        3.0 * reward_reach
-        + 5.0 * reward_grasp
-        + 1.0 * reward_lift  # Note: reward_lift has internal scaling up to ~15
-        + 1.0 * reward_success
-        + 1.0 * reward_joint_vel
-        + 1.0 * reward_action_mag
+        reward_approach + 
+        reward_lift + 
+        reward_grasp + 
+        reward_success + 
+        reward_penalty_action + 
+        reward_penalty_smoothness
     )
 
     # ----------------------------------------------------------------------
     # 5. Logging
     # ----------------------------------------------------------------------
-    try:
-        # Log individual reward components for debugging
-        env.extras["episode"]["GPT/r_reach"] = reward_reach.mean().item()
-        env.extras["episode"]["GPT/r_grasp"] = reward_grasp.mean().item()
-        env.extras["episode"]["GPT/r_lift"] = reward_lift.mean().item()
-        env.extras["episode"]["GPT/r_success"] = reward_success.mean().item()
-        
-        # Log useful physical metrics
-        env.extras["episode"]["GPT/dist_tcp_cube"] = dist_tcp_cube.mean().item()
-        env.extras["episode"]["GPT/mean_finger_pos"] = mean_finger_pos.mean().item()
-        env.extras["episode"]["GPT/soft_grasp_signal"] = soft_grasp.mean().item()
-        env.extras["episode"]["GPT/cube_height"] = cube_height.mean().item()
-    except Exception:
-        pass # Ensure training doesn't crash if logging fails
+    env.extras["GPT/reward_approach"] = reward_approach.mean()
+    env.extras["GPT/reward_lift"] = reward_lift.mean()
+    env.extras["GPT/reward_grasp"] = reward_grasp.mean()
+    env.extras["GPT/reward_success"] = reward_success.mean()
+    env.extras["GPT/dist_tcp_cube"] = dist.mean()
+    env.extras["GPT/cube_height"] = cube_height.mean()
+    
+    # REQUIRED: Success Rate Log
+    env.extras["GPT/success"] = is_success.mean()
 
     return total_reward

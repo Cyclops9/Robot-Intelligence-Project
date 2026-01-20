@@ -1,27 +1,23 @@
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoTokenizer, AutoProcessor
+import torch
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
-# default: Load the model on the available device(s)
+# 1. Load Model (Use bfloat16 for speed/memory if on Ampere+ GPU, else float16)
 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-    "Qwen/Qwen2.5-VL-7B-Instruct", torch_dtype="auto", device_map="auto"
+    "Qwen/Qwen2.5-VL-7B-Instruct",
+    torch_dtype="auto",
+    device_map="auto"
 )
-
-# We recommend enabling flash_attention_2 for better acceleration and memory saving, especially in multi-image and video scenarios.
-# model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-#     "Qwen/Qwen2.5-VL-7B-Instruct",
-#     torch_dtype=torch.bfloat16,
-#     attn_implementation="flash_attention_2",
-#     device_map="auto",
-# )
-
-# default processer
 processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
 
-# The default range for the number of visual tokens per image in the model is 4-16384.
-# You can set min_pixels and max_pixels according to your needs, such as a token range of 256-1280, to balance performance and cost.
-# min_pixels = 256*28*28
-# max_pixels = 1280*28*28
-# processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct", min_pixels=min_pixels, max_pixels=max_pixels)
+# 2. Improved Prompt (Chain of Thought)
+# We ask it to look for the GAP between the object and the table.
+prompt_text = (
+    "You are a Physics Compliance Officer. Watch the video frame-by-frame.\n"
+    "Task is to lift the cube from the table. Give a score from 0 to 100 to the robotic arm,\n"
+    "100 is the best meaning robotic arm was successfull lifting the cube, 0 is the worst meaning robotic arm was not even doing related movement to lift the cube.\n"
+    ""
+)
 
 messages = [
     {
@@ -29,20 +25,23 @@ messages = [
         "content": [
             {
                 "type": "video",
-                "video": "rl-video-step-0.mp4",
-                "max_pixels": 360 * 420,
-                "fps": 1.0,
+                "video": "rl-video-step-23.mp4",
+                # FIX 1: Higher resolution to see the gap
+                "max_pixels": 420 * 560, 
+                # FIX 2: Higher FPS to catch the motion
+                "fps": 4.0, 
             },
-            {"type": "text", "text": "In the video, can the robot lift the object."},
+            {"type": "text", "text": prompt_text},
         ],
     }
 ]
 
-# Preparation for inference
+# 3. Inference
 text = processor.apply_chat_template(
     messages, tokenize=False, add_generation_prompt=True
 )
 image_inputs, video_inputs = process_vision_info(messages)
+
 inputs = processor(
     text=[text],
     images=image_inputs,
@@ -52,12 +51,13 @@ inputs = processor(
 )
 inputs = inputs.to("cuda")
 
-# Inference: Generation of the output
-generated_ids = model.generate(**inputs, max_new_tokens=128)
+# Generate slightly more tokens to allow for reasoning
+generated_ids = model.generate(**inputs, max_new_tokens=256)
 generated_ids_trimmed = [
-    out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+    out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
 ]
 output_text = processor.batch_decode(
     generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
 )
-print(output_text)
+
+print(f"\n[QWEN ANALYSIS]:\n{output_text[0]}")

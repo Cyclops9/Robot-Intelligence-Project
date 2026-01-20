@@ -1,0 +1,177 @@
+
+You are an expert RL Reward Designer.
+Your goal is to IMPROVE the reward function for: Isaac-Lift-Cube-Franka-v0.
+
+--- ENVIRONMENT CONTEXT ---
+
+TASK: Isaac-Lift-Cube-Franka-v0
+
+--- SCENE ASSETS (Correct Names) ---
+  - env.scene['robot'] (Articulation)   -> The Franka Robot
+  - env.scene['object'] (RigidObject)   -> The Cube (Target to lift)
+  - env.scene['ee_frame'] (Frame)       -> End Effector Frame (The Gripper)
+  - env.scene['table'] (RigidObject)    -> Table Surface
+
+--- ACTION SPACE ---
+  - Size: 8 Dimensions
+  - [0-6]: Arm Joint Positions (7 DOF)
+  - [7]:   Gripper Position (1 DOF)
+
+
+--- CRITICAL RULES ---
+1. You MUST return a single tensor 'total_reward'.
+2. You MUST log components to env.extras['GPT/name'] = value.mean().
+3. Use torch operations. Tensors must be on env.device.
+4. The system deletes old rewards. You MUST re-implement 'action_rate' or 'smoothness' penalties to prevent shaking.
+
+--- COMMON PITFALLS ---
+1. DO NOT access 'env.actions'. The 'env' object is a ManagerBasedRLEnv.
+2. To access the robot's current joint positions, use: 
+   env.scene['robot'].data.joint_pos
+3. To access the last applied action, use:
+   env.action_manager.action
+
+
+--- PREVIOUS CODE ---
+```python
+import torch
+
+def compute_reward(env):
+    """
+    Improved Reward Function for Isaac-Lift-Cube-Franka-v0
+    
+    Improvements:
+    1. Fixed Vanishing Gradient: Replaced tight tanh reach reward with an exp kernel 
+       that provides gradients even at 0.7m distance (previous feedback showed mean dist ~0.74).
+    2. Staged Grasp Logic: Explicitly rewards opening gripper during approach and closing 
+       gripper only when within a tight threshold (<3.5cm) of the object.
+    3. Conditional Lift: Lift reward is heavily scaled but gated by proximity to ensure 
+       the robot is actually holding the object, not just hitting it.
+    4. Orientation shaping: Encourages vertical gripper alignment to facilitate grasping.
+    """
+    # ----------------------------------------------------------------------
+    # 1. State Extraction
+    # ----------------------------------------------------------------------
+    # TCP state (End Effector)
+    tcp_pos = env.scene["ee_frame"].data.target_pos_w[..., 0, :]
+    tcp_quat = env.scene["ee_frame"].data.target_quat_w[..., 0, :]
+    
+    # Cube state
+    cube_pos = env.scene["object"].data.root_pos_w[..., 0:3]
+    cube_height = cube_pos[..., 2]
+    
+    # Actions (for penalties and grasp control)
+    actions = env.action_manager.action
+    
+    # ----------------------------------------------------------------------
+    # 2. Geometric Relations
+    # ----------------------------------------------------------------------
+    # Distance from Gripper Center to Cube Center
+    dist = torch.norm(tcp_pos - cube_pos, dim=-1)
+    
+    # Orientation Alignment (Downwards)
+    # Convert quaternion to the Z-component of the local Z-axis in World frame.
+    # For a standard top-down grasp, local Z should align with World -Z.
+    # q = (w, x, y, z). Z_world_z = 1 - 2(x^2 + y^2)
+    q_x, q_y = tcp_quat[:, 1], tcp_quat[:, 2]
+    z_dir_z = 1.0 - 2.0 * (q_x**2 + q_y**2)
+    
+    # We want z_dir_z to be -1.0. Calculate alignment error [0, 2]
+    # 0 = perfect down, 2 = perfect up
+    orient_error = (z_dir_z + 1.0).abs()
+    
+    # ----------------------------------------------------------------------
+    # 3. Reward Components
+    # ----------------------------------------------------------------------
+    
+    # --- A. Reach Reward ---
+    # Previous implementation failed because tanh(20*d) saturated at d=0.74.
+    # Use exp(-3*d) which decays slower. At 0.74m, rew ~ 0.10 (provides gradient).
+    reward_reach = torch.exp(-3.0 * dist)
+    
+    # --- B. Orientation Reward ---
+    # Soft constraints to guide the gripper to point down
+    reward_orient = torch.exp(-2.0 * orient_error)
+    
+    # --- C. Grasping Logic ---
+    # Gripper Action: -1 = Close, +1 = Open (approximate for Franka/Isaac)
+    gripper_action = actions[:, 7]
+    
+    # Approach Phase: If far, reward opening the gripper to minimize collision/prepare.
+    # Threshold 0.05m ensures we don't interfere with the actual grasp attempt.
+    is_approach = (dist > 0.05).float()
+    reward_open = is_approach * (gripper_action * 0.2) # Small nudge to open
+    
+    # Grasp Phase: If very close, reward closing the gripper.
+    # Threshold 0.035m (Cube radius ~0.02 + tolerance).
+    is_grasp_pos = (dist < 0.035).float()
+    # If action is -1 (close), -(-1) = +1. If action is 1 (open), -1.
+    reward_close = is_grasp_pos * (-gripper_action)
+    
+    # --- D. Lift Reward ---
+    table_height = 0.02
+    target_height = 0.5
+    
+    # Reward for height above table
+    lift_metric = torch.clamp(cube_height - (table_height + 0.01), min=0.0)
+    
+    # Gate lift reward: Only reward lifting if we are close to the object (holding it).
+    # This prevents the agent from learning to strike the object to make it jump.
+    holding_gate = (dist < 0.1).float()
+    
+    # Scale aggressively (30.0). 10cm lift = 3.0 reward (dominates reach).
+    reward_lift = lift_metric * 30.0 * holding_gate
+    
+    # --- E. Success Bonus ---
+    is_success = (cube_height > (target_height - 0.1)).float()
+    reward_success = is_success * 5.0
+    
+    # --- F. Penalties ---
+    # Action smoothness
+    reward_penalty = -0.01 * torch.sum(actions**2, dim=-1)
+    
+    # ----------------------------------------------------------------------
+    # 4. Total and Logging
+    # ----------------------------------------------------------------------
+    total_reward = (
+        reward_reach * 1.5      # Base reach (Max 1.5)
+        + reward_orient * 0.5   # Orientation guidance (Max 0.5)
+        + reward_open           # Shaping (Max 0.2)
+        + reward_close * 2.0    # Grasp trigger (Max 2.0) - High value to force grasp
+        + reward_lift           # Lift (Unbounded, but typically 0-15)
+        + reward_success        # Bonus
+        + reward_penalty
+    )
+
+    # Log components
+    try:
+        env.extras["GPT/Reach"] = reward_reach.mean()
+        env.extras["GPT/Orient"] = reward_orient.mean()
+        env.extras["GPT/Lift"] = reward_lift.mean()
+        env.extras["GPT/Close"] = reward_close.mean()
+        env.extras["GPT/Dist"] = dist.mean()
+        env.extras["GPT/Height"] = cube_height.mean()
+    except Exception:
+        pass
+
+    return total_reward
+--- FEEDBACK (Performance of Previous Code) --- Feedback for Candidate 1:
+--- GROUND TRUTH ---
+Success Rate: 0.00 (1.0 = 100% success)
+Timeout Rate: 1.00 (High timeout = robot is stuck)
+Total Reward: 2.68
+--- REWARD COMPONENTS ---
+
+
+[VISUAL CRITIQUE FROM VLM]
+The robotic arm in the video is positioned on top of a black platform. The arm appears to be in a resting state, with its joints and segments in a neutral position. There are no visible signs of movement or action from the robotic arm in the provided frames. The arm seems to be stationary, possibly waiting for an instruction or command to begin its operation.
+
+--- INSTRUCTIONS ---
+
+Analyze the feedback. Identify which components are zero (not working) or negative (penalties too high).
+
+Generate ONE improved reward function.
+
+CRITICAL: Return ONLY the Python code block. Do not add conversational text like "Here is the code".
+
+The function signature must be def compute_reward(env):. 
