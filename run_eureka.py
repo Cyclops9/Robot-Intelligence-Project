@@ -28,7 +28,7 @@ RESULTS_DIR = os.path.join(BASE_DIR, "results")
 # -----------------------------------------------------------------------------
 # 1. GEMINI SETUP & PROMPTING
 # -----------------------------------------------------------------------------
-API_KEY = 'AIzaSyDceYS8RslgPXDw5E8vqBbEXu6yZjUqtZ0'
+API_KEY = ''
 if not API_KEY:
     raise ValueError("Please set the GEMINI_API_KEY environment variable.")
 
